@@ -1,0 +1,8 @@
+.git
+image/output*
+image/dist
+image/.packer-cache
+image/packer_cache
+*.qcow2
+*.iso
+*.log

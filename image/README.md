@@ -20,7 +20,7 @@ The template defaults to the Ubuntu 24.04 OVMF files
 
 ## Obtain the evaluation ISO
 
-Download the 64-bit English Windows Server 2025 evaluation ISO from the
+The 64-bit English Windows Server 2025 evaluation ISO comes from the
 [Microsoft Evaluation Center](https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2025).
 The evaluation ISO provides the same `Windows Server 2025 SERVERSTANDARD`
 edition name used by the answer file. To verify an unfamiliar ISO, mount it and
@@ -30,11 +30,19 @@ run:
 dism /Get-WimInfo /WimFile:D:\sources\install.wim
 ```
 
-Compute the checksum on the Linux bake host:
+`build.sh` keeps both the Windows ISO and the virtio-win ISO in a local cache
+directory (`ISO_CACHE_DIR`, default `image/.packer-cache`) and hands Packer
+file paths, so the ISOs are only ever downloaded once. Two ways to supply the
+Windows ISO:
 
-```bash
-sha256sum /path/to/Windows_Server_2025.iso
-```
+- Set `ISO_URL` to the Evaluation Center download link. On the first run
+  `build.sh` downloads it to `$ISO_CACHE_DIR/windows-server-2025.iso`.
+- Or set `ISO_PATH` to an ISO you already have (or copy one to the default
+  cache path).
+
+If `ISO_CHECKSUM` (`sha256:<digest>`) is set the local file is verified
+against it; otherwise the checksum is computed from the local file and only
+used to satisfy Packer's own verification.
 
 ## Build
 
@@ -42,10 +50,14 @@ Generate the runtime key first, then run the wrapper from this directory:
 
 ```bash
 ../runtime/gen-keys.sh
-ISO_PATH=/absolute/path/to/Windows_Server_2025.iso
-export ISO_URL="file://$ISO_PATH"
-export ISO_CHECKSUM="sha256:$(sha256sum "$ISO_PATH" | awk '{print $1}')"
+export ISO_URL='https://go.microsoft.com/fwlink/?linkid=...'   # first run only
 ./build.sh
+```
+
+or with a pre-downloaded ISO:
+
+```bash
+ISO_PATH=/absolute/path/to/Windows_Server_2025.iso ./build.sh
 ```
 
 `IMAGE_VERSION` defaults to the current UTC/local host date in `YYYYMMDD`
@@ -61,8 +73,8 @@ PKR_VAR_memory=16384 \
 ./build.sh
 ```
 
-The first build downloads the current stable virtio-win ISO into
-`image/.packer-cache`. Set `VIRTIO_WIN_ISO_PATH` to use a pre-downloaded ISO.
+The first build downloads the current stable virtio-win ISO into the same
+cache directory. Set `VIRTIO_WIN_ISO_PATH` to use a pre-downloaded ISO.
 Packer typically takes 30 to 90 minutes, depending on host and network speed.
 The result is `dist/win-base-<version>.qcow2` plus a sha256sum-compatible
 `.sha256` file.

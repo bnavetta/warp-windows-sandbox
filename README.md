@@ -42,6 +42,8 @@ vm stop                       # graceful shutdown + cleanup
 - `scripts/` - `rebuild-check.sh` (eval clock) and `arc-sweep.sh` (Phase 2 cleanup).
 - `tests/` - bash tests for the pure-shell parts of `vm` (run on any OS).
 - `docker-compose.yml` - local Linux harness for driving `vm` by hand.
+- `devbox/` - Namespace Devbox base image with Packer, QEMU/KVM, Docker and
+  lint tools for doing the bake and runtime testing remotely (see below).
 
 ## Prerequisites
 
@@ -72,6 +74,24 @@ docker compose exec windows-sandbox vm stop
 In an Oz environment, use this image as the base, set the `VM_IMAGE_*`
 variables, and optionally run `vm prefetch` in the init script so the download
 happens before the agent starts.
+
+## Developing on a Namespace Devbox
+
+The Mac cannot run KVM, so the bake and the runtime smoke test happen on a
+Namespace Devbox (which exposes `/dev/kvm` with nested virtualization).
+
+```
+# one-time: build the dev image (context is the repo root)
+devbox image build . --name=warp/windows-sandbox-dev -f devbox/Dockerfile
+
+# create the devbox from devbox.yaml and connect
+devbox create --from devbox.yaml
+devbox ssh windows-sandbox-dev
+```
+
+Inside the devbox the repo is checked out under `/workspaces/`, and `packer`,
+`qemu-system-x86_64`, `docker compose`, `shellcheck` and `xmllint` are all
+available.
 
 ## Testing
 

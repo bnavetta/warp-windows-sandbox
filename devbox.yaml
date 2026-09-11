@@ -1,0 +1,9 @@
+# Namespace Devbox spec. Build the image first:
+#   devbox image build . --name=warp/windows-sandbox-dev -f devbox/Dockerfile
+# then:
+#   devbox create --from devbox.yaml
+name: windows-sandbox-dev
+image: warp/windows-sandbox-dev
+size: l
+volume_size_gb: 200
+repository: https://github.com/bnavetta/warp-windows-sandbox
