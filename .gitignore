@@ -1,0 +1,13 @@
+# Generated SSH keypair for the guest (run runtime/gen-keys.sh)
+runtime/keys/
+
+# Packer build output
+image/output*/
+image/packer_cache/
+image/*.qcow2
+image/*.sha256
+image/.packer.d/
+
+# Local scratch
+*.log
+.DS_Store

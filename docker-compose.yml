@@ -1,0 +1,18 @@
+services:
+  windows-sandbox:
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+    devices:
+      - /dev/kvm:/dev/kvm
+    environment:
+      WARP_BUILD_CACHE_ROOT: /build-cache
+      VM_IMAGE_URL: ${VM_IMAGE_URL:?Set VM_IMAGE_URL}
+      VM_IMAGE_VERSION: ${VM_IMAGE_VERSION:?Set VM_IMAGE_VERSION}
+      VM_IMAGE_SHA256: ${VM_IMAGE_SHA256:-}
+    volumes:
+      - windows-build-cache:/build-cache
+    command: sleep infinity
+
+volumes:
+  windows-build-cache:

@@ -1,0 +1,635 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VM_LIBEXEC=${VM_LIBEXEC:-/usr/local/lib/windows-vm}
+# shellcheck disable=SC1091
+source "$VM_LIBEXEC/common.sh"
+# shellcheck disable=SC1091
+source "$VM_LIBEXEC/qemu-args.sh"
+# shellcheck disable=SC1091
+source "$VM_LIBEXEC/arc.sh"
+
+VM_STATE_DIR=$(resolve_state_dir)
+VM_SSH_PORT=${VM_SSH_PORT:-2222}
+VM_RDP_PORT=${VM_RDP_PORT:-13389}
+VM_WINRM_PORT=${VM_WINRM_PORT:-15985}
+VM_CPUS=${VM_CPUS:-$(command_exists nproc && nproc || printf '2\n')}
+VM_MEM=${VM_MEM:-4G}
+# Fixed hardware identity. These must match the constants in
+# image/windows-server-2025.pkr.hcl so licensing state baked into the image
+# stays valid across runs. Do not randomize.
+VM_UUID=${VM_UUID:-7b7f3b1e-6b3e-4f2a-9c1a-2d0e8a5c4f01}
+VM_MAC=${VM_MAC:-52:54:00:12:34:56}
+VM_SMBIOS_SERIAL=${VM_SMBIOS_SERIAL:-WINSANDBOX-0001}
+VM_SSH_USER=${VM_SSH_USER:-vmuser}
+VM_SSH_KEY=${VM_SSH_KEY:-/usr/local/lib/windows-vm/id_ed25519}
+VM_QEMU_BIN=${VM_QEMU_BIN:-qemu-system-x86_64}
+
+VM_PID_FILE=$VM_STATE_DIR/qemu.pid
+VM_QMP_SOCKET=$VM_STATE_DIR/qmp.sock
+VM_SERIAL_LOG=$VM_STATE_DIR/serial.log
+VM_QEMU_LOG=$VM_STATE_DIR/qemu.log
+VM_OVERLAY=$VM_STATE_DIR/overlay.qcow2
+VM_OVMF_VARS_RUNTIME=$VM_STATE_DIR/OVMF_VARS.fd
+VM_FORWARD_REGISTRY=$VM_STATE_DIR/forwards
+VM_STARTED_AT=$VM_STATE_DIR/started-at
+VM_RUNNING_IMAGE_VERSION=$VM_STATE_DIR/image-version
+VM_RUNTIME_SSH_KEY=$VM_STATE_DIR/id_ed25519
+
+usage() {
+    cat <<'EOF'
+Usage: vm <command> [options]
+
+Commands:
+  prefetch                         Download and cache the pristine image
+  start [options]                  Start the Windows VM and wait for SSH
+  run [options] -- <command...>    Run a command in the guest
+  run [options] -                  Run a PowerShell script from stdin
+  cp <src> <dst>                   Copy a file; prefix guest paths with vm:
+  forward add HOST:GUEST           Add a runtime port forward
+  forward rm HOST:GUEST            Remove a runtime port forward
+  forward ls                       List active port forwards
+  status                           Show VM state and connection details
+  wait [--timeout SECONDS]         Wait for guest SSH
+  stop [--force] [--timeout N]     Stop the VM and remove per-run state
+  console                          Follow the serial console log
+  help                             Show this help
+
+start options:
+  --cpus N                         Virtual CPU count
+  --mem SIZE                       Guest memory, such as 4G
+  --forward HOST:GUEST             Add a port forward at launch
+  --vnc                            Enable VNC on 127.0.0.1:5900
+
+run options:
+  --user USER                      Guest SSH user
+  --timeout SECONDS                Command timeout when timeout(1) is available
+  --shell pwsh|cmd                 Guest command shell (default: pwsh)
+EOF
+}
+
+require_running() {
+    pid_is_running "$VM_PID_FILE" || die "Windows VM is not running"
+}
+
+cleanup_stale_state() {
+    if [[ -e $VM_STATE_DIR ]]; then
+        if pid_is_running "$VM_PID_FILE"; then
+            die "Windows VM is already running"
+        fi
+        log "removing stale VM state from $VM_STATE_DIR"
+        safe_remove_state_dir "$VM_STATE_DIR"
+    fi
+}
+
+prefetch_image() {
+    local cache_dir
+    local destination
+    local download_tmp
+    local checksum_tmp
+    local expected_checksum=${VM_IMAGE_SHA256:-}
+    local actual_checksum
+
+    require_image_version
+    [[ -n ${VM_IMAGE_URL:-} ]] || die "VM_IMAGE_URL must be set"
+    cache_dir=$(resolve_cache_dir) ||
+        die "set VM_CACHE_DIR or WARP_BUILD_CACHE_ROOT before using the image cache"
+    mkdir -p "$cache_dir"
+    destination=$(image_path)
+
+    command_exists flock || die "flock is required for synchronized image downloads"
+    exec 8>"$cache_dir/.windows-vm.lock"
+    flock 8
+    if [[ -f $destination ]]; then
+        log "using cached image $destination"
+        flock -u 8
+        exec 8>&-
+        return
+    fi
+
+    download_tmp=$(mktemp "$cache_dir/.image-download.XXXXXX")
+    checksum_tmp=$(mktemp "$cache_dir/.image-checksum.XXXXXX")
+    log "downloading $VM_IMAGE_URL"
+    if ! curl -fL --retry 3 --output "$download_tmp" "$VM_IMAGE_URL"; then
+        rm -f "$download_tmp" "$checksum_tmp"
+        die "failed to download VM image from $VM_IMAGE_URL"
+    fi
+
+    if [[ -z $expected_checksum ]]; then
+        if curl -fsSL --retry 2 --output "$checksum_tmp" "${VM_IMAGE_URL}.sha256"; then
+            read -r expected_checksum _ <"$checksum_tmp" || true
+        else
+            warn "no checksum configured and ${VM_IMAGE_URL}.sha256 was unavailable; skipping verification"
+        fi
+    fi
+
+    if [[ -n $expected_checksum ]]; then
+        actual_checksum=$(sha256_file "$download_tmp")
+        if [[ ${actual_checksum,,} != "${expected_checksum,,}" ]]; then
+            rm -f "$download_tmp" "$checksum_tmp"
+            die "VM image checksum mismatch: expected $expected_checksum, got $actual_checksum"
+        fi
+        log "verified VM image sha256"
+    fi
+
+    mv "$download_tmp" "$destination"
+    rm -f "$checksum_tmp"
+    flock -u 8
+    exec 8>&-
+    log "cached image at $destination"
+}
+
+ssh_command() {
+    local user=$1
+
+    printf '%s\n' ssh \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        -o IdentitiesOnly=yes \
+        -p "$VM_SSH_PORT" \
+        -i "$VM_RUNTIME_SSH_KEY" \
+        "$user@127.0.0.1"
+}
+
+vm_ssh() {
+    local user=$1
+    local timeout_seconds=$2
+    shift 2
+    local -a ssh_args=()
+    local item
+
+    while IFS= read -r item; do
+        ssh_args+=("$item")
+    done < <(ssh_command "$user")
+
+    if [[ $timeout_seconds -gt 0 ]] && command_exists timeout; then
+        timeout "$timeout_seconds" "${ssh_args[@]}" "$@"
+    else
+        if [[ $timeout_seconds -gt 0 ]]; then
+            warn "timeout(1) is unavailable; running without a local timeout"
+        fi
+        "${ssh_args[@]}" "$@"
+    fi
+}
+
+wait_for_ssh() {
+    local timeout_seconds=$1
+    local deadline=$((SECONDS + timeout_seconds))
+
+    require_running
+    while ((SECONDS < deadline)); do
+        if vm_ssh "$VM_SSH_USER" 0 'exit 0' </dev/null >/dev/null 2>&1; then
+            return 0
+        fi
+        if ! pid_is_running "$VM_PID_FILE"; then
+            die "QEMU exited before guest SSH became ready; inspect $VM_QEMU_LOG"
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+record_forward() {
+    local spec=$1
+
+    touch "$VM_FORWARD_REGISTRY"
+    if ! grep -Fxq "$spec" "$VM_FORWARD_REGISTRY"; then
+        printf '%s\n' "$spec" >>"$VM_FORWARD_REGISTRY"
+    fi
+}
+
+remove_forward_record() {
+    local spec=$1
+    local temporary
+
+    [[ -f $VM_FORWARD_REGISTRY ]] || return 0
+    temporary=$VM_FORWARD_REGISTRY.tmp
+    grep -Fxv "$spec" "$VM_FORWARD_REGISTRY" >"$temporary" || true
+    mv "$temporary" "$VM_FORWARD_REGISTRY"
+}
+
+forward_add() {
+    local spec=$1
+    local host_port
+    local guest_port
+
+    validate_forward_spec "$spec" ||
+        die "invalid port forward '$spec'; expected HOST_PORT:GUEST_PORT"
+    require_running
+    if [[ -f $VM_FORWARD_REGISTRY ]] && grep -Eq "^${spec%%:*}:" "$VM_FORWARD_REGISTRY"; then
+        die "host port ${spec%%:*} is already forwarded"
+    fi
+    host_port=$(forward_host_port "$spec")
+    guest_port=$(forward_guest_port "$spec")
+    qmp_human_command "$VM_QMP_SOCKET" \
+        "hostfwd_add tcp:127.0.0.1:${host_port}-:${guest_port}" >/dev/null
+    record_forward "$spec"
+    log "forwarded 127.0.0.1:$host_port to guest port $guest_port"
+}
+
+forward_remove() {
+    local spec=$1
+    local host_port
+
+    validate_forward_spec "$spec" ||
+        die "invalid port forward '$spec'; expected HOST_PORT:GUEST_PORT"
+    require_running
+    grep -Fxq "$spec" "$VM_FORWARD_REGISTRY" 2>/dev/null ||
+        die "port forward is not active: $spec"
+    host_port=$(forward_host_port "$spec")
+    qmp_human_command "$VM_QMP_SOCKET" \
+        "hostfwd_remove tcp:127.0.0.1:${host_port}" >/dev/null
+    remove_forward_record "$spec"
+    log "removed port forward $spec"
+}
+
+show_forwards() {
+    if [[ -s $VM_FORWARD_REGISTRY ]]; then
+        cat "$VM_FORWARD_REGISTRY"
+    else
+        printf 'none\n'
+    fi
+}
+
+stop_vm() {
+    local force=$1
+    local timeout_seconds=$2
+    local pid
+    local deadline
+
+    if ! pid_is_running "$VM_PID_FILE"; then
+        [[ -e $VM_STATE_DIR ]] && safe_remove_state_dir "$VM_STATE_DIR"
+        log "Windows VM is stopped"
+        return
+    fi
+
+    read -r pid <"$VM_PID_FILE"
+    if [[ $force == false ]]; then
+        arc_disconnect_hook || warn "Azure Arc disconnect failed; continuing shutdown"
+        if [[ -S $VM_QMP_SOCKET ]]; then
+            qmp_execute "$VM_QMP_SOCKET" system_powerdown >/dev/null ||
+                warn "QMP powerdown failed; waiting before forcing shutdown"
+        else
+            warn "QMP socket is unavailable; waiting before forcing shutdown"
+        fi
+        deadline=$((SECONDS + timeout_seconds))
+        while ((SECONDS < deadline)); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+    fi
+
+    if kill -0 "$pid" 2>/dev/null; then
+        warn "forcing QEMU process $pid to stop"
+        kill -KILL "$pid" 2>/dev/null || true
+        local attempts=5
+        while kill -0 "$pid" 2>/dev/null && ((attempts > 0)); do
+            sleep 1
+            attempts=$((attempts - 1))
+        done
+    fi
+    safe_remove_state_dir "$VM_STATE_DIR"
+    log "Windows VM stopped"
+}
+
+command_start() {
+    local cpus=$VM_CPUS
+    local memory=$VM_MEM
+    local display_mode=none
+    local base_image
+    local ovmf_vars_source
+    local wait_timeout=${VM_START_TIMEOUT:-300}
+    local -a forwards=("$VM_RDP_PORT:3389" "$VM_WINRM_PORT:5985")
+    local seen_host_ports=" $VM_SSH_PORT "
+    local host_port
+
+    while (($#)); do
+        case $1 in
+            --cpus)
+                (($# >= 2)) || die "--cpus requires a value"
+                cpus=$2
+                shift 2
+                ;;
+            --mem)
+                (($# >= 2)) || die "--mem requires a value"
+                memory=$2
+                shift 2
+                ;;
+            --forward)
+                (($# >= 2)) || die "--forward requires HOST_PORT:GUEST_PORT"
+                validate_forward_spec "$2" ||
+                    die "invalid port forward '$2'; expected HOST_PORT:GUEST_PORT"
+                forwards+=("$2")
+                shift 2
+                ;;
+            --vnc)
+                display_mode=vnc
+                shift
+                ;;
+            *)
+                die "unknown start option: $1"
+                ;;
+        esac
+    done
+
+    [[ $cpus =~ ^[1-9][0-9]*$ ]] || die "--cpus must be a positive integer"
+    validate_forward_spec "$VM_SSH_PORT:22" ||
+        die "VM_SSH_PORT must be a port number from 1 to 65535"
+    local spec
+    for spec in "${forwards[@]}"; do
+        host_port=$(forward_host_port "$spec") ||
+            die "invalid port forward '$spec'; expected HOST_PORT:GUEST_PORT"
+        if [[ $seen_host_ports == *" $host_port "* ]]; then
+            die "host port $host_port is configured more than once"
+        fi
+        seen_host_ports+="$host_port "
+    done
+    [[ -r /dev/kvm && -w /dev/kvm ]] ||
+        die "/dev/kvm is unavailable; use a Linux host with KVM and nested virtualization enabled"
+    cleanup_stale_state
+    prefetch_image
+    base_image=$(image_path)
+    VM_OVMF_CODE_RESOLVED=$(find_ovmf_code)
+    ovmf_vars_source=$(find_ovmf_vars)
+    [[ -r $VM_OVMF_CODE_RESOLVED ]] || die "OVMF code firmware not found: $VM_OVMF_CODE_RESOLVED"
+    [[ -r $ovmf_vars_source ]] || die "OVMF vars firmware not found: $ovmf_vars_source"
+
+    mkdir -p "$VM_STATE_DIR"
+    prepare_ssh_key "$VM_SSH_KEY" "$VM_RUNTIME_SSH_KEY"
+    cp "$ovmf_vars_source" "$VM_OVMF_VARS_RUNTIME"
+    if ! qemu-img create -f qcow2 -F qcow2 -b "$base_image" "$VM_OVERLAY"; then
+        safe_remove_state_dir "$VM_STATE_DIR"
+        die "failed to create the throwaway qcow2 overlay"
+    fi
+    : >"$VM_FORWARD_REGISTRY"
+    for spec in "${forwards[@]}"; do
+        record_forward "$spec"
+    done
+    printf '%s\n' "$VM_IMAGE_VERSION" >"$VM_RUNNING_IMAGE_VERSION"
+    date +%s >"$VM_STARTED_AT"
+
+    build_qemu_args "$cpus" "$memory" "$display_mode" "${forwards[@]}"
+    log "starting Windows Server 2025"
+    if ! setsid "$VM_QEMU_BIN" "${QEMU_ARGS[@]}" >>"$VM_QEMU_LOG" 2>&1; then
+        safe_remove_state_dir "$VM_STATE_DIR"
+        die "QEMU failed to launch"
+    fi
+    if ! wait_for_ssh "$wait_timeout"; then
+        warn "guest SSH did not become ready within ${wait_timeout}s"
+        stop_vm true 0
+        die "Windows VM failed to start; inspect $VM_QEMU_LOG"
+    fi
+    arc_connect_hook
+
+    printf 'Windows VM is ready\n'
+    printf '  SSH: 127.0.0.1:%s (%s)\n' "$VM_SSH_PORT" "$VM_SSH_USER"
+    printf '  Image version: %s\n' "$VM_IMAGE_VERSION"
+    printf '  Forwarded ports:\n'
+    sed 's/^/    /' "$VM_FORWARD_REGISTRY"
+}
+
+command_run() {
+    local user=$VM_SSH_USER
+    local timeout_seconds=0
+    local guest_shell=pwsh
+    local stdin_script=false
+    local remote_command
+    local -a command_args=()
+
+    while (($#)); do
+        case $1 in
+            --user)
+                (($# >= 2)) || die "--user requires a value"
+                user=$2
+                shift 2
+                ;;
+            --timeout)
+                (($# >= 2)) || die "--timeout requires seconds"
+                [[ $2 =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer"
+                timeout_seconds=$2
+                shift 2
+                ;;
+            --shell)
+                (($# >= 2)) || die "--shell requires pwsh or cmd"
+                guest_shell=$2
+                shift 2
+                ;;
+            --)
+                shift
+                command_args=("$@")
+                break
+                ;;
+            -)
+                stdin_script=true
+                shift
+                (($# == 0)) || die "no arguments are allowed after '-'"
+                break
+                ;;
+            *)
+                command_args=("$@")
+                break
+                ;;
+        esac
+    done
+
+    [[ $guest_shell == pwsh || $guest_shell == cmd ]] ||
+        die "--shell must be pwsh or cmd"
+    require_running
+    if [[ $stdin_script == true ]]; then
+        if [[ $guest_shell == cmd ]]; then
+            vm_ssh "$user" "$timeout_seconds" cmd.exe /Q
+        else
+            vm_ssh "$user" "$timeout_seconds" \
+                powershell.exe -NoProfile -NonInteractive -Command -
+        fi
+        return
+    fi
+    ((${#command_args[@]} > 0)) || die "run requires a command or '-'"
+    remote_command=$(shell_join "${command_args[@]}")
+    if [[ $guest_shell == cmd ]]; then
+        vm_ssh "$user" "$timeout_seconds" cmd.exe /c "$remote_command"
+    else
+        vm_ssh "$user" "$timeout_seconds" "$remote_command"
+    fi
+}
+
+command_cp() {
+    local source=$1
+    local destination=$2
+    local -a scp_args=(
+        -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o BatchMode=yes
+        -o ConnectTimeout=5
+        -o IdentitiesOnly=yes
+        -P "$VM_SSH_PORT"
+        -i "$VM_RUNTIME_SSH_KEY"
+    )
+
+    require_running
+    if [[ $source == vm:* && $destination == vm:* ]]; then
+        die "exactly one cp path must use the vm: prefix"
+    elif [[ $source == vm:* ]]; then
+        source="$VM_SSH_USER@127.0.0.1:${source#vm:}"
+    elif [[ $destination == vm:* ]]; then
+        destination="$VM_SSH_USER@127.0.0.1:${destination#vm:}"
+    else
+        die "exactly one cp path must use the vm: prefix"
+    fi
+    scp "${scp_args[@]}" "$source" "$destination"
+}
+
+command_forward() {
+    local action=${1:-}
+
+    case $action in
+        add)
+            (($# == 2)) || die "usage: vm forward add HOST_PORT:GUEST_PORT"
+            forward_add "$2"
+            ;;
+        rm)
+            (($# == 2)) || die "usage: vm forward rm HOST_PORT:GUEST_PORT"
+            forward_remove "$2"
+            ;;
+        ls)
+            (($# == 1)) || die "usage: vm forward ls"
+            show_forwards
+            ;;
+        *)
+            die "usage: vm forward add|rm|ls"
+            ;;
+    esac
+}
+
+command_status() {
+    local pid
+    local started
+    local uptime
+    local image_version=unknown
+
+    if ! pid_is_running "$VM_PID_FILE"; then
+        printf 'status: stopped\n'
+        return 1
+    fi
+    read -r pid <"$VM_PID_FILE"
+    if [[ -s $VM_STARTED_AT ]]; then
+        read -r started <"$VM_STARTED_AT"
+        uptime=$(($(date +%s) - started))
+    else
+        uptime=unknown
+    fi
+    if [[ -s $VM_RUNNING_IMAGE_VERSION ]]; then
+        read -r image_version <"$VM_RUNNING_IMAGE_VERSION"
+    fi
+    printf 'status: running\n'
+    printf 'pid: %s\n' "$pid"
+    printf 'uptime_seconds: %s\n' "$uptime"
+    printf 'ssh: 127.0.0.1:%s\n' "$VM_SSH_PORT"
+    printf 'image_version: %s\n' "$image_version"
+    printf 'forwards:\n'
+    show_forwards | sed 's/^/  /'
+}
+
+command_wait() {
+    local timeout_seconds=300
+
+    while (($#)); do
+        case $1 in
+            --timeout)
+                (($# >= 2)) || die "--timeout requires seconds"
+                [[ $2 =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer"
+                timeout_seconds=$2
+                shift 2
+                ;;
+            *)
+                die "unknown wait option: $1"
+                ;;
+        esac
+    done
+    if wait_for_ssh "$timeout_seconds"; then
+        log "guest SSH is ready"
+    else
+        die "guest SSH did not become ready within ${timeout_seconds}s"
+    fi
+}
+
+command_stop() {
+    local force=false
+    local timeout_seconds=90
+
+    while (($#)); do
+        case $1 in
+            --force)
+                force=true
+                shift
+                ;;
+            --timeout)
+                (($# >= 2)) || die "--timeout requires seconds"
+                [[ $2 =~ ^[0-9]+$ ]] || die "--timeout must be a non-negative integer"
+                timeout_seconds=$2
+                shift 2
+                ;;
+            *)
+                die "unknown stop option: $1"
+                ;;
+        esac
+    done
+    stop_vm "$force" "$timeout_seconds"
+}
+
+command_console() {
+    [[ -f $VM_SERIAL_LOG ]] || die "serial log does not exist: $VM_SERIAL_LOG"
+    printf 'Following %s (Ctrl-C to exit).\n' "$VM_SERIAL_LOG"
+    printf 'If VNC was enabled, connect to 127.0.0.1:5900.\n'
+    tail -n 100 -f "$VM_SERIAL_LOG"
+}
+
+main() {
+    local command=${1:-help}
+    (($# == 0)) || shift
+
+    case $command in
+        prefetch)
+            (($# == 0)) || die "prefetch takes no arguments"
+            prefetch_image
+            ;;
+        start)
+            command_start "$@"
+            ;;
+        run)
+            command_run "$@"
+            ;;
+        cp)
+            (($# == 2)) || die "usage: vm cp <src> <dst>"
+            command_cp "$1" "$2"
+            ;;
+        forward)
+            command_forward "$@"
+            ;;
+        status)
+            (($# == 0)) || die "status takes no arguments"
+            command_status
+            ;;
+        wait)
+            command_wait "$@"
+            ;;
+        stop)
+            command_stop "$@"
+            ;;
+        console)
+            (($# == 0)) || die "console takes no arguments"
+            command_console
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            usage >&2
+            die "unknown command: $command"
+            ;;
+    esac
+}
+
+main "$@"
