@@ -33,6 +33,7 @@ The guest's default OpenSSH shell is PowerShell:
 vm run -- '$PSVersionTable'
 vm run -- Get-Service sshd
 vm run --shell cmd -- ver
+vm run --transport winrm -- Get-ComputerInfo
 ```
 
 Quote PowerShell expressions with single quotes in Bash so Bash does not expand
@@ -48,6 +49,13 @@ POWERSHELL
 
 Use `--timeout SECONDS` for commands that might hang. The guest exit code is the
 exit code of `vm run`.
+
+SSH is the default command transport. WinRM uses pywinrm and the Administrator
+credential embedded in both images. Select it per command with
+`--transport winrm`, or set `VM_TRANSPORT=winrm`. `VM_WINRM_USER` defaults to
+`Administrator`; `--user` overrides the selected transport's user for one
+command. `VM_WINRM_PASSWORD` and `VM_WINRM_PASSWORD_FILE` override the embedded
+credential.
 
 Copy files in either direction by prefixing the guest path with `vm:`:
 
@@ -85,6 +93,12 @@ and `/tmp/windows-vm` when `/run` is not writable:
 Use `vm status` to inspect state. Use `vm console` to follow the serial log. If
 boot debugging needs a graphical display, start with `vm start --vnc` and
 connect to `127.0.0.1:5900`.
+
+When startup fails, `vm` preserves the entire state directory instead of
+deleting it. `vm status` prints the recorded failure and paths to any QEMU or
+serial logs. Inspect those files before retrying; the next `vm start` removes
+the stale state automatically. `vm stop` also explicitly clears preserved
+failure state.
 
 The guest is a fresh copy of the base image on every start; nothing persists in
 the VM between `vm stop` and the next `vm start`. Copy results out with `vm cp`

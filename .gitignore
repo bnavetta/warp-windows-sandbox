@@ -1,4 +1,4 @@
-# Generated SSH keypair for the guest (run runtime/gen-keys.sh)
+# Generated SSH keypair and Administrator password (run runtime/gen-keys.sh)
 runtime/keys/
 
 # Packer build output

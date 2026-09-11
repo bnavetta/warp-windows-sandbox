@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 Write-Host 'Configuring OpenSSH Server'
+Set-LocalUser -Name 'Administrator' -PasswordNeverExpires $true
 
 $capability = Get-WindowsCapability -Online |
     Where-Object Name -Like 'OpenSSH.Server*' |

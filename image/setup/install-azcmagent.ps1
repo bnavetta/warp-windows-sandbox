@@ -26,8 +26,7 @@ if (Test-Path $agentPath) {
     Remove-Item -Path $msiPath -Force -ErrorAction SilentlyContinue
 }
 
-# Phase 2 runtime hooks connect only when every required ARC_* variable is set.
-# Keep the agent dormant in Phase 1 so the evaluation image has no Arc identity.
+# Azure Arc is not configured yet, so disable the agent.
 $himds = Get-Service -Name 'himds' -ErrorAction SilentlyContinue
 if ($himds) {
     if ($himds.Status -ne 'Stopped') {

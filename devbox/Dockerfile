@@ -25,6 +25,7 @@ RUN apt-get update \
         lsb-release \
         openssh-client \
         ovmf \
+        p7zip-full \
         qemu-system-x86 \
         qemu-utils \
         shellcheck \

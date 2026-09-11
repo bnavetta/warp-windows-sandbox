@@ -5,5 +5,4 @@
 name: windows-sandbox-dev
 image: warp/windows-sandbox-dev
 size: l
-volume_size_gb: 200
-repository: https://github.com/bnavetta/warp-windows-sandbox
+volume_size_gb: 300

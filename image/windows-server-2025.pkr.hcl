@@ -19,15 +19,10 @@ variable "iso_checksum" {
   description = "Windows ISO checksum, preferably prefixed with sha256:."
 }
 
-variable "virtio_win_iso_url" {
-  type        = string
-  description = "Source URL for the stable virtio-win driver ISO."
-  default     = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
-}
 
-variable "virtio_win_iso_path" {
+variable "virtio_stage_dir" {
   type        = string
-  description = "Local path to the virtio-win ISO downloaded by build.sh."
+  description = "Local directory containing the Server 2025 virtio drivers staged by build.sh."
 }
 
 variable "output_dir" {
@@ -42,7 +37,7 @@ variable "image_version" {
 
   validation {
     condition     = can(regex("^[0-9]{8}$", var.image_version))
-    error_message = "image_version must use YYYYMMDD format."
+    error_message = "The image_version value must use YYYYMMDD format."
   }
 }
 
@@ -143,14 +138,25 @@ source "qemu" "windows_server_2025" {
   output_directory = var.output_dir
   vm_name          = "win-base-${var.image_version}.qcow2"
   headless         = var.headless
-  boot_wait        = "10s"
-  boot_command     = ["<spacebar>"]
+  # The Windows UEFI bootloader shows "Press any key to boot from CD or DVD"
+  # for ~5s after OVMF POSTs; missing it drops into the UEFI shell. Press space
+  # every second from t=2s to t=13s to cover the window. Extra presses after
+  # Setup starts are harmless.
+  boot_wait = "2s"
+  boot_command = [
+    "<spacebar><wait1s><spacebar><wait1s><spacebar><wait1s><spacebar><wait1s>",
+    "<spacebar><wait1s><spacebar><wait1s><spacebar><wait1s><spacebar><wait1s>",
+    "<spacebar><wait1s><spacebar><wait1s><spacebar><wait1s><spacebar>",
+  ]
 
-  net_device     = "virtio-net"
-  cdrom_interface = "sata"
+  net_device = "virtio-net"
+  # QEMU has no if=sata; on q35, if=ide drives land on the AHCI (SATA) controller.
+  cdrom_interface = "ide"
 
   cd_label = "PROVISION"
   cd_files = [
+    "${var.virtio_stage_dir}/$WinPEDriver$",
+    "${var.virtio_stage_dir}/virtio-win-guest-tools.exe",
     "${path.root}/setup/enable-openssh.ps1",
     "${path.root}/setup/enable-rdp.ps1",
     "${path.root}/setup/install-virtio-guest-tools.ps1",
@@ -173,13 +179,9 @@ source "qemu" "windows_server_2025" {
   shutdown_command = "shutdown /s /t 10 /f /d p:4:1"
   shutdown_timeout = "15m"
 
-  # Do not use -drive here: the QEMU plugin treats it as a replacement for all
-  # generated drives. build.sh downloads the virtio ISO and -cdrom attaches it
-  # without removing the installer, target disk, or provisioning CD.
   qemuargs = [
     ["-uuid", local.vm_uuid],
     ["-smbios", "type=1,serial=${local.vm_smbios_serial}"],
-    ["-cdrom", var.virtio_win_iso_path],
     ["-device", "virtio-net-pci,netdev=user.0,mac=${local.vm_mac}"],
   ]
 }

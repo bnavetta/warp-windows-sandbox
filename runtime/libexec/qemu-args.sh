@@ -41,7 +41,9 @@ build_qemu_args() {
         -name windows-sandbox
         -enable-kvm
         -machine "q35,accel=kvm"
-        -cpu "host,hv_relaxed,hv_vapic,hv_spinlocks=0x1fff,hv_time,hv_synic,hv_stimer"
+        # Hyper-V enlightenments exposed by KVM to the Windows guest. SynIC and
+        # synthetic timers depend on the virtual-processor index MSR.
+        -cpu "host,hv_relaxed,hv_vapic,hv_spinlocks=0x1fff,hv_time,hv_vpindex,hv_synic,hv_stimer"
         -smp "$cpus"
         -m "$memory"
         -uuid "$VM_UUID"

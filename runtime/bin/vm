@@ -1,7 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VM_LIBEXEC=${VM_LIBEXEC:-/usr/local/lib/windows-vm}
+resolve_script_path() {
+    local source=${BASH_SOURCE[0]}
+    local directory
+    local target
+
+    # Follow symlinks so /usr/local/bin/vm can point at a self-contained
+    # runtime tree without changing how support files are discovered.
+    while [[ -L $source ]]; do
+        directory=$(CDPATH='' cd -P -- "$(dirname -- "$source")" && pwd)
+        target=$(readlink "$source")
+        if [[ $target == /* ]]; then
+            source=$target
+        else
+            source=$directory/$target
+        fi
+    done
+    directory=$(CDPATH='' cd -P -- "$(dirname -- "$source")" && pwd)
+    printf '%s/%s\n' "$directory" "$(basename -- "$source")"
+}
+
+VM_SCRIPT_PATH=$(resolve_script_path)
+VM_SCRIPT_DIR=${VM_SCRIPT_PATH%/*}
+VM_RUNTIME_ROOT=$(CDPATH='' cd -- "$VM_SCRIPT_DIR/.." && pwd)
+
+if [[ -z ${VM_LIBEXEC:-} ]]; then
+    if [[ -f $VM_RUNTIME_ROOT/libexec/common.sh ]]; then
+        VM_LIBEXEC=$VM_RUNTIME_ROOT/libexec
+    else
+        VM_LIBEXEC=/usr/local/lib/windows-vm
+    fi
+fi
+if [[ ! -f $VM_LIBEXEC/common.sh ]]; then
+    printf '[windows-vm] error: support files not found relative to %s or in %s\n' \
+        "$VM_SCRIPT_PATH" "$VM_LIBEXEC" >&2
+    exit 1
+fi
 # shellcheck disable=SC1091
 source "$VM_LIBEXEC/common.sh"
 # shellcheck disable=SC1091
@@ -13,6 +48,7 @@ VM_STATE_DIR=$(resolve_state_dir)
 VM_SSH_PORT=${VM_SSH_PORT:-2222}
 VM_RDP_PORT=${VM_RDP_PORT:-13389}
 VM_WINRM_PORT=${VM_WINRM_PORT:-15985}
+VM_TRANSPORT=${VM_TRANSPORT:-ssh}
 VM_CPUS=${VM_CPUS:-$(command_exists nproc && nproc || printf '2\n')}
 VM_MEM=${VM_MEM:-4G}
 # Fixed hardware identity. These must match the constants in
@@ -22,7 +58,23 @@ VM_UUID=${VM_UUID:-7b7f3b1e-6b3e-4f2a-9c1a-2d0e8a5c4f01}
 VM_MAC=${VM_MAC:-52:54:00:12:34:56}
 VM_SMBIOS_SERIAL=${VM_SMBIOS_SERIAL:-WINSANDBOX-0001}
 VM_SSH_USER=${VM_SSH_USER:-vmuser}
-VM_SSH_KEY=${VM_SSH_KEY:-/usr/local/lib/windows-vm/id_ed25519}
+VM_WINRM_USER=${VM_WINRM_USER:-Administrator}
+VM_WINRM_ENDPOINT=${VM_WINRM_ENDPOINT:-http://127.0.0.1:$VM_WINRM_PORT/wsman}
+VM_WINRM_RUNNER=${VM_WINRM_RUNNER:-$VM_LIBEXEC/winrm-run.py}
+if [[ -z ${VM_WINRM_PASSWORD_FILE:-} ]]; then
+    if [[ -f $VM_RUNTIME_ROOT/keys/administrator_password ]]; then
+        VM_WINRM_PASSWORD_FILE=$VM_RUNTIME_ROOT/keys/administrator_password
+    else
+        VM_WINRM_PASSWORD_FILE=$VM_LIBEXEC/administrator_password
+    fi
+fi
+if [[ -z ${VM_SSH_KEY:-} ]]; then
+    if [[ -f $VM_RUNTIME_ROOT/keys/id_ed25519 ]]; then
+        VM_SSH_KEY=$VM_RUNTIME_ROOT/keys/id_ed25519
+    else
+        VM_SSH_KEY=$VM_LIBEXEC/id_ed25519
+    fi
+fi
 VM_QEMU_BIN=${VM_QEMU_BIN:-qemu-system-x86_64}
 
 VM_PID_FILE=$VM_STATE_DIR/qemu.pid
@@ -35,6 +87,7 @@ VM_FORWARD_REGISTRY=$VM_STATE_DIR/forwards
 VM_STARTED_AT=$VM_STATE_DIR/started-at
 VM_RUNNING_IMAGE_VERSION=$VM_STATE_DIR/image-version
 VM_RUNTIME_SSH_KEY=$VM_STATE_DIR/id_ed25519
+VM_FAILURE_FILE=$VM_STATE_DIR/start-failure
 
 usage() {
     cat <<'EOF'
@@ -62,9 +115,13 @@ start options:
   --vnc                            Enable VNC on 127.0.0.1:5900
 
 run options:
-  --user USER                      Guest SSH user
+  --transport ssh|winrm            Command transport (default: VM_TRANSPORT or ssh)
+  --user USER                      Guest user (default depends on transport)
   --timeout SECONDS                Command timeout when timeout(1) is available
   --shell pwsh|cmd                 Guest command shell (default: pwsh)
+
+WinRM defaults to the embedded Administrator credential. Override it with
+VM_WINRM_PASSWORD or VM_WINRM_PASSWORD_FILE.
 EOF
 }
 
@@ -174,17 +231,79 @@ vm_ssh() {
     fi
 }
 
+vm_winrm() {
+    local user=$1
+    local timeout_seconds=$2
+    local guest_shell=$3
+    local -a runner_args=(
+        python3
+        "$VM_WINRM_RUNNER"
+        --endpoint "$VM_WINRM_ENDPOINT"
+        --user "$user"
+        --shell "$guest_shell"
+    )
+
+    [[ -n ${VM_WINRM_PASSWORD:-} || -r $VM_WINRM_PASSWORD_FILE ]] ||
+        die "WinRM password not found: $VM_WINRM_PASSWORD_FILE"
+    command_exists python3 || die "python3 is required for the WinRM transport"
+    [[ -r $VM_WINRM_RUNNER ]] || die "WinRM runner not found: $VM_WINRM_RUNNER"
+
+    if [[ $timeout_seconds -gt 0 ]] && command_exists timeout; then
+        timeout "$timeout_seconds" env \
+            VM_WINRM_PASSWORD_FILE="$VM_WINRM_PASSWORD_FILE" \
+            "${runner_args[@]}"
+    else
+        if [[ $timeout_seconds -gt 0 ]]; then
+            warn "timeout(1) is unavailable; running without a local timeout"
+        fi
+        env VM_WINRM_PASSWORD_FILE="$VM_WINRM_PASSWORD_FILE" "${runner_args[@]}"
+    fi
+}
+
+record_start_failure() {
+    local message=$1
+
+    mkdir -p "$VM_STATE_DIR"
+    printf '%s\n' "$message" >"$VM_FAILURE_FILE"
+    warn "$message"
+    warn "preserving failed VM state for troubleshooting: $VM_STATE_DIR"
+    if [[ -f $VM_QEMU_LOG ]]; then
+        warn "QEMU log: $VM_QEMU_LOG"
+    fi
+    if [[ -f $VM_SERIAL_LOG ]]; then
+        warn "serial log: $VM_SERIAL_LOG"
+    fi
+}
+
+terminate_qemu_preserving_state() {
+    local pid
+    local attempts=5
+
+    pid_is_running "$VM_PID_FILE" || return 0
+    read -r pid <"$VM_PID_FILE"
+    warn "stopping failed QEMU process $pid without deleting diagnostic state"
+    kill -KILL "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null && ((attempts > 0)); do
+        sleep 1
+        attempts=$((attempts - 1))
+    done
+}
+
 wait_for_ssh() {
     local timeout_seconds=$1
     local deadline=$((SECONDS + timeout_seconds))
 
-    require_running
+    if ! pid_is_running "$VM_PID_FILE"; then
+        warn "QEMU is not running while waiting for guest SSH"
+        return 1
+    fi
     while ((SECONDS < deadline)); do
         if vm_ssh "$VM_SSH_USER" 0 'exit 0' </dev/null >/dev/null 2>&1; then
             return 0
         fi
         if ! pid_is_running "$VM_PID_FILE"; then
-            die "QEMU exited before guest SSH became ready; inspect $VM_QEMU_LOG"
+            warn "QEMU exited before guest SSH became ready"
+            return 1
         fi
         sleep 1
     done
@@ -360,8 +479,8 @@ command_start() {
     prepare_ssh_key "$VM_SSH_KEY" "$VM_RUNTIME_SSH_KEY"
     cp "$ovmf_vars_source" "$VM_OVMF_VARS_RUNTIME"
     if ! qemu-img create -f qcow2 -F qcow2 -b "$base_image" "$VM_OVERLAY"; then
-        safe_remove_state_dir "$VM_STATE_DIR"
-        die "failed to create the throwaway qcow2 overlay"
+        record_start_failure "failed to create the throwaway qcow2 overlay"
+        die "VM startup failed; diagnostic state was preserved at $VM_STATE_DIR"
     fi
     : >"$VM_FORWARD_REGISTRY"
     for spec in "${forwards[@]}"; do
@@ -373,13 +492,13 @@ command_start() {
     build_qemu_args "$cpus" "$memory" "$display_mode" "${forwards[@]}"
     log "starting Windows Server 2025"
     if ! setsid "$VM_QEMU_BIN" "${QEMU_ARGS[@]}" >>"$VM_QEMU_LOG" 2>&1; then
-        safe_remove_state_dir "$VM_STATE_DIR"
-        die "QEMU failed to launch"
+        record_start_failure "QEMU failed to launch"
+        die "VM startup failed; diagnostic state was preserved at $VM_STATE_DIR"
     fi
     if ! wait_for_ssh "$wait_timeout"; then
-        warn "guest SSH did not become ready within ${wait_timeout}s"
-        stop_vm true 0
-        die "Windows VM failed to start; inspect $VM_QEMU_LOG"
+        record_start_failure "guest SSH did not become ready within ${wait_timeout}s"
+        terminate_qemu_preserving_state
+        die "VM startup failed; diagnostic state was preserved at $VM_STATE_DIR"
     fi
     arc_connect_hook
 
@@ -391,7 +510,8 @@ command_start() {
 }
 
 command_run() {
-    local user=$VM_SSH_USER
+    local transport=$VM_TRANSPORT
+    local user=
     local timeout_seconds=0
     local guest_shell=pwsh
     local stdin_script=false
@@ -400,6 +520,11 @@ command_run() {
 
     while (($#)); do
         case $1 in
+            --transport)
+                (($# >= 2)) || die "--transport requires ssh or winrm"
+                transport=$2
+                shift 2
+                ;;
             --user)
                 (($# >= 2)) || die "--user requires a value"
                 user=$2
@@ -434,11 +559,22 @@ command_run() {
         esac
     done
 
+    [[ $transport == ssh || $transport == winrm ]] ||
+        die "--transport must be ssh or winrm"
     [[ $guest_shell == pwsh || $guest_shell == cmd ]] ||
         die "--shell must be pwsh or cmd"
+    if [[ -z $user ]]; then
+        if [[ $transport == winrm ]]; then
+            user=$VM_WINRM_USER
+        else
+            user=$VM_SSH_USER
+        fi
+    fi
     require_running
     if [[ $stdin_script == true ]]; then
-        if [[ $guest_shell == cmd ]]; then
+        if [[ $transport == winrm ]]; then
+            vm_winrm "$user" "$timeout_seconds" "$guest_shell"
+        elif [[ $guest_shell == cmd ]]; then
             vm_ssh "$user" "$timeout_seconds" cmd.exe /Q
         else
             vm_ssh "$user" "$timeout_seconds" \
@@ -448,7 +584,10 @@ command_run() {
     fi
     ((${#command_args[@]} > 0)) || die "run requires a command or '-'"
     remote_command=$(shell_join "${command_args[@]}")
-    if [[ $guest_shell == cmd ]]; then
+    if [[ $transport == winrm ]]; then
+        printf '%s' "$remote_command" |
+            vm_winrm "$user" "$timeout_seconds" "$guest_shell"
+    elif [[ $guest_shell == cmd ]]; then
         vm_ssh "$user" "$timeout_seconds" cmd.exe /c "$remote_command"
     else
         vm_ssh "$user" "$timeout_seconds" "$remote_command"
@@ -511,6 +650,19 @@ command_status() {
 
     if ! pid_is_running "$VM_PID_FILE"; then
         printf 'status: stopped\n'
+        if [[ -s $VM_FAILURE_FILE ]]; then
+            printf 'last_start_failure: '
+            cat "$VM_FAILURE_FILE"
+            printf 'diagnostic_state: %s\n' "$VM_STATE_DIR"
+            if [[ -f $VM_QEMU_LOG ]]; then
+                printf 'qemu_log: %s\n' "$VM_QEMU_LOG"
+            fi
+            if [[ -f $VM_SERIAL_LOG ]]; then
+                printf 'serial_log: %s\n' "$VM_SERIAL_LOG"
+            fi
+        elif [[ -e $VM_STATE_DIR ]]; then
+            printf 'stale_state: %s\n' "$VM_STATE_DIR"
+        fi
         return 1
     fi
     read -r pid <"$VM_PID_FILE"
@@ -527,6 +679,7 @@ command_status() {
     printf 'pid: %s\n' "$pid"
     printf 'uptime_seconds: %s\n' "$uptime"
     printf 'ssh: 127.0.0.1:%s\n' "$VM_SSH_PORT"
+    printf 'winrm: %s\n' "$VM_WINRM_ENDPOINT"
     printf 'image_version: %s\n' "$image_version"
     printf 'forwards:\n'
     show_forwards | sed 's/^/  /'
@@ -632,4 +785,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

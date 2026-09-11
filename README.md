@@ -1,13 +1,14 @@
 # windows-sandbox
 
-A Docker base image for Oz cloud agent environments that lets the agent run a
+A Docker base image for Warp cloud agent environments that lets the agent run a
 KVM-accelerated Windows Server 2025 VM inside the sandbox.
 
-The agent harness is the container entrypoint. This image adds a `vm` CLI:
+This image adds a `vm` CLI:
 
 ```
 vm start                      # boot the VM (downloads the base image on first use)
 vm run -- Get-ComputerInfo    # run PowerShell in the guest
+vm run --transport winrm -- Get-ComputerInfo
 vm run --shell cmd -- ver     # or cmd.exe
 vm cp ./artifact.zip vm:C:\Users\vmuser\artifact.zip
 vm forward add 8080:8080      # reach a guest service from the container
@@ -16,34 +17,27 @@ vm stop                       # graceful shutdown + cleanup
 
 ## How it works
 
-- **Virtualization:** plain QEMU/KVM. No libvirt, no Vagrant. OVMF (UEFI), no TPM,
-  virtio disk and NIC, Hyper-V enlightenments enabled.
-- **Image caching:** a pristine `win-base-<version>.qcow2` is downloaded once from
-  `$VM_IMAGE_URL` into the persistent cache dir (`$VM_CACHE_DIR`, or
-  `$WARP_BUILD_CACHE_ROOT/windows` in Oz). Every `vm start` boots a throwaway
-  qcow2 overlay in `$VM_STATE_DIR`, so the cached image is never modified.
+- **Virtualization:** plain QEMU/KVM, using QEMU's support for UEFI via OVMF, virtio disks
+  and NICs, and Hyper-V enlightenments.
+- **Image caching:** the Windows server image is cached and used to create a per-VM overlay.
 - **Networking:** QEMU user-mode (slirp) networking. The guest gets the
   container's outbound access with no extra capabilities. The container reaches
-  the guest through `hostfwd` rules on `127.0.0.1` (SSH always; others via
-  `vm forward add`). The guest reaches the container at `10.0.2.2`.
+  the guest through `hostfwd` rules on `127.0.0.1` (SSH, RDP, and WinRM by
+  default; others via `vm forward add`). The guest reaches the container at
+  `10.0.2.2`.
 - **Fixed hardware identity:** UUID, SMBIOS serial and MAC are constants shared by
   the image bake and the runtime so that licensing state baked into the image
   survives across runs. Do not randomize them.
-- **Licensing:** Phase 1 uses the 180-day evaluation edition; the image is
-  rebuilt on a schedule (`scripts/rebuild-check.sh` reports remaining days).
-  Phase 2 switches to Windows Server 2025 pay-as-you-go via Azure Arc; the
-  runtime hooks (`ARC_*` env vars) are already present and are no-ops until set.
 
 ## Layout
 
 - `runtime/` - the Docker image: `Dockerfile`, `bin/vm`, `libexec/`, and the
   `windows-vm` agent skill.
-- `image/` - one-time Packer bake of the Windows base image. See `image/README.md`.
-- `scripts/` - `rebuild-check.sh` (eval clock) and `arc-sweep.sh` (Phase 2 cleanup).
+- `image/` - Packer definition the Windows base image. See `image/README.md`.
 - `tests/` - bash tests for the pure-shell parts of `vm` (run on any OS).
 - `docker-compose.yml` - local Linux harness for driving `vm` by hand.
 - `devbox/` - Namespace Devbox base image with Packer, QEMU/KVM, Docker and
-  lint tools for doing the bake and runtime testing remotely (see below).
+  lint tools for doing the build and runtime testing remotely (see below).
 
 ## Prerequisites
 
@@ -56,7 +50,7 @@ vm stop                       # graceful shutdown + cleanup
 ## Quickstart
 
 ```
-# one-time: generate the guest SSH keypair used by both the bake and the runtime
+# one-time: generate the guest SSH keypair and Administrator password
 runtime/gen-keys.sh
 
 # build the runtime image (build context is the repo root)
@@ -71,27 +65,16 @@ docker compose exec windows-sandbox vm run -- systeminfo
 docker compose exec windows-sandbox vm stop
 ```
 
-In an Oz environment, use this image as the base, set the `VM_IMAGE_*`
+`vm run` uses SSH by default. Pass `--transport winrm` to use pywinrm, or set
+`VM_TRANSPORT=winrm` to make it the default. The generated Administrator
+password is built into both the Windows image and runtime image; override it
+with `VM_WINRM_PASSWORD` or `VM_WINRM_PASSWORD_FILE` when needed.
+Build both images from the same `runtime/keys/` directory. Rotating those
+credentials requires rebuilding both images.
+
+In a Warp agentenvironment, use this image as the base, set the `VM_IMAGE_*`
 variables, and optionally run `vm prefetch` in the init script so the download
 happens before the agent starts.
-
-## Developing on a Namespace Devbox
-
-The Mac cannot run KVM, so the bake and the runtime smoke test happen on a
-Namespace Devbox (which exposes `/dev/kvm` with nested virtualization).
-
-```
-# one-time: build the dev image (context is the repo root)
-devbox image build . --name=warp/windows-sandbox-dev -f devbox/Dockerfile
-
-# create the devbox from devbox.yaml and connect
-devbox create --from devbox.yaml
-devbox ssh windows-sandbox-dev
-```
-
-Inside the devbox the repo is checked out under `/workspaces/`, and `packer`,
-`qemu-system-x86_64`, `docker compose`, `shellcheck` and `xmllint` are all
-available.
 
 ## Testing
 
